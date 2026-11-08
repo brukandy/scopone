@@ -6,7 +6,7 @@
 <title>Scopone — impara giocando</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-<script src="peerjs.min.js"></script>
+<script src="mqtt.min.js"></script>
 <style>
 :root{--felt:#1f5a3c;--felt2:#174630;--cream:#fbf6ea;--ink:#1d1a16;--muted:#6b6458;--gold:#c9971c;--red:#b83227;--blue:#245a9c;--green:#2e7a36;--accent:#f2c14e}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -370,9 +370,7 @@ let mode='home';           // home | local | host | client
 let S=null, A=null, view=0, nick=lsGet('scopone_nick')||'';
 let myId=lsGet('scopone_pid');if(!myId){myId='p'+Math.random().toString(36).slice(2,10);lsSet('scopone_pid',myId);}
 let sel=null, hintOn=false, anim=null, queue=Promise.resolve(), queuedRev=-1, shownResult=-1;
-let peer=null, conns=new Map(), hostConn=null, code=null, loadTimer=null, wakeLock=null;
-const PEER_PREFIX='scopone-bl-';
-const PEER_CFG={config:{iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'}]}};
+let links=[], lastSeen=new Map(), pending=null, conLost=false, lastHostMsg=0, hbTimer=null, code=null, loadTimer=null, wakeLock=null;
 
 function showScreen(id){document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id));}
 function seatName(p){if(mode==='local')return POSNAME[(p-view+4)%4];if(!S||!S.seats)return '—';const s=S.seats[p];
@@ -409,7 +407,6 @@ function hostCommit(ns){
   A=ns;pushState(sanitize(A,myId));
   if(mode==='host'){broadcast();lsSet('scopone_hostgame',JSON.stringify({code,A}));}
 }
-function broadcast(){for(const [pid,c] of conns){if(c.open){try{c.send({t:'state',S:sanitize(A,pid)});}catch(e){}}}}
 function bump(){A.rev++;}
 function maybeBot(){
   if(!isDriver()||!A||A.phase!=='play')return;
@@ -420,8 +417,7 @@ function maybeBot(){
 function userPlay(m){
   if(!myTurnNow())return;sel=null;
   if(isDriver()){const ns=clone(A);if(applyMove(ns,view,m))hostCommit(ns);}
-  else if(hostConn&&hostConn.open){hostConn.send({t:'move',m});$('#actions').innerHTML='';}
-  else toast('Non sei collegato al tavolo.');
+  else{sendPending({t:'move',m});$('#actions').innerHTML='';if(!netUp())toast('Connessione assente: riprovo appena torna.');}
 }
 function hostSit(pid,name,i){
   if(!A||A.phase!=='lobby'||i<0||i>3||A.seats[i])return;
@@ -432,22 +428,6 @@ function hostStand(pid){if(!A||A.phase!=='lobby')return;const ns=clone(A);const 
 function hostSetSeat(i,val){if(!A||A.phase!=='lobby')return;const ns=clone(A);ns.seats[i]=val;ns.rev++;hostCommit(ns);}
 function setOnFlag(pid,on){if(!A)return;const i=A.seats.findIndex(x=>x&&x.pid===pid);if(i<0||A.seats[i].on===on)return;
   const ns=clone(A);ns.seats[i].on=on;ns.rev++;hostCommit(ns);}
-function onHostData(c,msg){
-  if(!msg||typeof msg!=='object')return;
-  if(msg.t==='hello'&&typeof msg.pid==='string'){
-    c.pid=msg.pid;const prev=conns.get(msg.pid);if(prev&&prev!==c){try{prev.close()}catch(e){}}
-    conns.set(msg.pid,c);
-    const i=A.seats.findIndex(x=>x&&x.pid===msg.pid);
-    if(i>=0){const ns=clone(A);ns.seats[i].on=true;if(msg.nick)ns.seats[i].nick=String(msg.nick).slice(0,14);ns.rev++;hostCommit(ns);}
-    else c.send({t:'state',S:sanitize(A,msg.pid)});
-    return;
-  }
-  if(!c.pid)return;
-  if(msg.t==='sit')hostSit(c.pid,msg.nick,+msg.i);
-  else if(msg.t==='stand')hostStand(c.pid);
-  else if(msg.t==='move'&&A.phase==='play'){const p=A.seats.findIndex(x=>x&&x.pid===c.pid);
-    if(p>=0){const ns=clone(A);if(applyMove(ns,p,msg.m))hostCommit(ns);else c.send({t:'state',S:sanitize(A,c.pid)});}}
-}
 
 /* ================= RENDER GAME ================= */
 function render(){
@@ -525,78 +505,108 @@ function startLocal(){
   dealHand(ns);hostCommit(ns);
 }
 
-/* ================= ONLINE (peer-to-peer, host authoritative) ================= */
+/* ================= ONLINE (relay MQTT su internet, host authoritative) ================= */
+/* Ogni telefono si collega a due broker MQTT pubblici (wss, porta 443) e i messaggi passano da lì:
+   funziona anche su 4G/5G e Wi-Fi dove la connessione diretta tra telefoni è bloccata. */
+const QB=new URLSearchParams(location.search).get('broker');
+const BROKERS=QB?[QB]:['wss://broker.hivemq.com:8884/mqtt','wss://broker.emqx.io:8084/mqtt'];
+const TOPIC='scopone-bl/v2/';
 function genCode(){const C='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<5;i++)s+=C[Math.floor(Math.random()*C.length)];return s;}
-function inviteLink(){return location.origin+location.pathname+'#'+code;}
-function closeNet(){for(const c of conns.values()){try{c.close()}catch(e){}}conns=new Map();if(hostConn){try{hostConn.close()}catch(e){}}hostConn=null;
-  if(peer){try{peer.destroy()}catch(e){}}peer=null;clearTimeout(loadTimer);}
+function inviteLink(){return location.origin+location.pathname+location.search+'#'+code;}
+function netOpen(subs,onMsg,onUp){
+  links=BROKERS.map(u=>{let c;try{c=mqtt.connect(u,{clientId:'scp_'+myId+'_'+Math.random().toString(36).slice(2,7),clean:true,reconnectPeriod:2000,connectTimeout:8000,keepalive:20});}catch(e){return null;}
+    c.on('connect',()=>{c.subscribe(subs,{qos:1});if(onUp)onUp();});
+    c.on('message',(t,p)=>{let m;try{m=JSON.parse(p.toString());}catch(e){return;}if(m&&typeof m==='object')onMsg(m);});
+    c.on('error',()=>{});
+    return c;}).filter(Boolean);
+}
+function netSend(topic,obj){const s=JSON.stringify(obj);for(const c of links){if(c.connected){try{c.publish(topic,s,{qos:1});}catch(e){}}}}
+function netUp(){return links.some(c=>c.connected);}
+function closeNet(){for(const c of links){try{c.end(true);}catch(e){}}links=[];clearInterval(hbTimer);hbTimer=null;clearTimeout(loadTimer);
+  lastSeen=new Map();pending=null;conLost=false;}
 function lobbyWait(msg){showScreen('lobby');$('#lobbyCode').textContent=code||'-----';$('#linkTxt').textContent=code?inviteLink():'';
   $('#seatGrid').innerHTML=`<div class="note" style="grid-column:1/3">${msg}</div>`;$('#lobbyActions').innerHTML='';}
+
+/* ---- host ---- */
+function sendTo(pid,obj){netSend(TOPIC+code+'/p/'+pid,obj);}
+function broadcast(){if(!A)return;const ids=new Set(lastSeen.keys());for(const s of A.seats)if(s&&s.pid&&!s.bot)ids.add(s.pid);ids.delete(myId);
+  for(const pid of ids)sendTo(pid,{t:'state',S:sanitize(A,pid)});}
 function startHost(resume){
-  if(!window.Peer){toast('Connessione non disponibile: ricarica la pagina.');return;}
+  if(!window.mqtt){toast('Connessione non disponibile: ricarica la pagina.');return;}
   resetSession();mode='host';
   code=resume?resume.code:genCode();
   try{history.replaceState(null,'','#'+code);}catch(e){}
   lobbyWait('Apro il tavolo…');
-  let attempts=0;
-  const open=()=>{
-    peer=new Peer(PEER_PREFIX+code,PEER_CFG);
-    peer.on('open',()=>{
-      if(resume){A=resume.A;queuedRev=-1;hostCommit(A);toast('Tavolo riaperto.');}
-      else if(!A){hostCommit(newMatch([{pid:myId,nick:nick||'Tu',bot:false,on:true},null,null,null],myId));}
-      else hostCommit(A);
-    });
-    peer.on('connection',c=>{
-      c.on('data',d=>onHostData(c,d));
-      c.on('close',()=>{if(c.pid&&conns.get(c.pid)===c){conns.delete(c.pid);setOnFlag(c.pid,false);}});
-      c.on('error',()=>{});
-    });
-    peer.on('disconnected',()=>{try{peer.reconnect()}catch(e){}});
-    peer.on('error',e=>{
-      if(e.type==='unavailable-id'){
-        attempts++;try{peer.destroy()}catch(x){}
-        if(resume&&attempts<8){lobbyWait('Riapro il tavolo, un attimo…');setTimeout(open,3000);}
-        else if(!resume){code=genCode();try{history.replaceState(null,'','#'+code);}catch(x){}open();}
-        else{toast('Non riesco a riaprire il tavolo. Creane uno nuovo.');goHome();}
-      }else if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'){toast('Problema di rete, riprovo…');}
-    });
-  };
-  open();
+  const now=Date.now();
+  if(resume){A=resume.A;for(const s of A.seats)if(s&&s.pid&&!s.bot&&s.pid!==myId)lastSeen.set(s.pid,now);}
+  netOpen([TOPIC+code+'/h'],onHostMsg,()=>broadcast());
+  if(resume){queuedRev=-1;hostCommit(A);toast('Tavolo riaperto.');}
+  else hostCommit(newMatch([{pid:myId,nick:nick||'Tu',bot:false,on:true},null,null,null],myId));
+  hbTimer=setInterval(()=>{
+    if(!A)return;const t=Date.now();
+    A.seats.forEach(s=>{if(s&&s.pid&&!s.bot&&s.pid!==myId&&s.on!==false&&t-(lastSeen.get(s.pid)||0)>15000)setOnFlag(s.pid,false);});
+  },4000);
+  setTimeout(()=>{if(mode==='host'&&!netUp())toast('Non riesco a collegarmi a internet: controlla la connessione.',5000);},10000);
 }
+function onHostMsg(msg){
+  const pid=msg.pid;if(typeof pid!=='string'||pid===myId||!A)return;
+  lastSeen.set(pid,Date.now());
+  const i=A.seats.findIndex(x=>x&&x.pid===pid);
+  const reply=()=>sendTo(pid,{t:'state',S:sanitize(A,pid)});
+  if(msg.t==='hello'){
+    const nk=msg.nick?String(msg.nick).slice(0,14):'';
+    if(i>=0&&(A.seats[i].on===false||(nk&&nk!==A.seats[i].nick))){const ns=clone(A);ns.seats[i].on=true;if(nk)ns.seats[i].nick=nk;ns.rev++;hostCommit(ns);}
+    else reply();
+    return;
+  }
+  if(msg.t==='hb'){if(i>=0&&A.seats[i].on===false)setOnFlag(pid,true);else sendTo(pid,{t:'hb',rev:A.rev});return;}
+  const rev=A.rev;
+  if(msg.t==='sit')hostSit(pid,msg.nick,+msg.i);
+  else if(msg.t==='stand')hostStand(pid);
+  else if(msg.t==='move'&&A.phase==='play'&&i>=0){const ns=clone(A);if(applyMove(ns,i,msg.m))hostCommit(ns);}
+  if(A.rev===rev)reply();
+}
+
+/* ---- giocatore che entra con il link ---- */
+function sendHost(m){netSend(TOPIC+code+'/h',Object.assign({pid:myId},m));}
+function sendPending(m){pending={m,at:Date.now()};sendHost(m);}
 function joinTable(c){
-  if(!window.Peer){toast('Connessione non disponibile: ricarica la pagina.');return;}
+  if(!window.mqtt){toast('Connessione non disponibile: ricarica la pagina.');return;}
   resetSession();mode='client';code=c;
   try{history.replaceState(null,'','#'+code);}catch(e){}
   lobbyWait('Mi collego al tavolo…');
-  loadTimer=setTimeout(()=>{if(!S)lobbyFail('Non riesco a collegarmi. Controlla che chi ha creato il tavolo abbia l\'app aperta, poi riprova.');},15000);
-  peer=new Peer(undefined,PEER_CFG);
-  peer.on('open',()=>{
-    hostConn=peer.connect(PEER_PREFIX+code,{reliable:true});
-    hostConn.on('open',()=>hostConn.send({t:'hello',pid:myId,nick}));
-    hostConn.on('data',msg=>{if(msg&&msg.t==='state'&&msg.S){clearTimeout(loadTimer);pushState(msg.S);}});
-    hostConn.on('close',()=>{if(mode==='client')lobbyFailOrToast();});
-  });
-  peer.on('disconnected',()=>{try{peer.reconnect()}catch(e){}});
-  peer.on('error',e=>{
-    if(e.type==='peer-unavailable')lobbyFail('Tavolo '+code+' non trovato: forse chi l\'ha creato ha chiuso l\'app. Fatti mandare un link nuovo o riprova.');
-    else if(!S)lobbyFail('Problema di connessione. Riprova.');
-  });
+  loadTimer=setTimeout(()=>{if(!S)lobbyFail(netUp()?'Tavolo '+code+' non trovato: chi l\'ha creato deve avere l\'app aperta. Fatti mandare il link giusto o riprova.':'Non riesco a collegarmi a internet. Controlla la connessione e riprova.');},20000);
+  lastHostMsg=Date.now();
+  netOpen([TOPIC+code+'/p/'+myId],onClientMsg,()=>sendHost({t:'hello',nick}));
+  hbTimer=setInterval(clientTick,3000);
 }
+function onClientMsg(msg){
+  lastHostMsg=Date.now();
+  if(conLost){conLost=false;toast('Di nuovo collegato al tavolo.');}
+  if(msg.t==='state'&&msg.S){clearTimeout(loadTimer);pending=null;pushState(msg.S);}
+  else if(msg.t==='hb'&&typeof msg.rev==='number'&&msg.rev>queuedRev)sendHost({t:'hello',nick});
+}
+function clientTick(){
+  if(!S){sendHost({t:'hello',nick});return;}
+  if(pending&&Date.now()-pending.at>3000){pending.at=Date.now();sendHost(pending.m);}
+  sendHost({t:'hb'});
+  if(!conLost&&Date.now()-lastHostMsg>15000){conLost=true;toast('Connessione al tavolo persa: riprovo da solo…',5000);}
+}
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState!=='visible')return;
+  for(const c of links){if(!c.connected){try{c.reconnect();}catch(e){}}}
+  if(mode==='client'&&code)sendHost({t:'hello',nick});
+});
 function lobbyFail(msg){clearTimeout(loadTimer);showScreen('lobby');$('#seatGrid').innerHTML=`<div class="warn" style="grid-column:1/3">${esc(msg)}</div>`;
   const la=$('#lobbyActions');la.innerHTML='';const b=document.createElement('button');b.className='btn go full';b.textContent='Riprova';b.onclick=()=>joinTable(code);la.appendChild(b);}
-function lobbyFailOrToast(){
-  if(S&&S.phase!=='lobby'){$('#status').innerHTML='<b>Connessione persa.</b>';
-    const a=$('#actions');a.innerHTML='';const b=document.createElement('button');b.className='btn go';b.textContent='Ricollegati';b.onclick=()=>joinTable(code);a.appendChild(b);}
-  else lobbyFail('Connessione al tavolo persa.');
-}
 function goHome(){resetSession();mode='home';$('#modal').classList.remove('on');try{history.replaceState(null,'',location.pathname+location.search);}catch(e){}showScreen('home');}
 
 function sit(i){
   if(!saveNick())return;
   if(mode==='host')hostSit(myId,nick,i);
-  else if(hostConn&&hostConn.open)hostConn.send({t:'sit',i,nick});
+  else sendPending({t:'sit',i,nick});
 }
-function stand(){if(mode==='host')hostStand(myId);else if(hostConn&&hostConn.open)hostConn.send({t:'stand'});}
+function stand(){if(mode==='host')hostStand(myId);else sendPending({t:'stand'});}
 function renderLobby(){
   const host=mode==='host';const seats=S.seats;const mine=seats.findIndex(x=>x&&x.pid===myId);
   $('#lobbyCode').textContent=code;$('#linkTxt').textContent=inviteLink();
