@@ -59,6 +59,10 @@ input.code::placeholder{letter-spacing:1px;font-weight:400;text-transform:none}
 #lobbyActions .note{margin-top:8px}
 .mid{grid-area:mid;aspect-ratio:1;background:var(--felt);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:13px;color:var(--soft);line-height:1.5;text-align:center;padding:6px}
 .btn.sm{padding:6px 8px;font-size:14px}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{flex:1;border:0;background:none;color:var(--soft);font-size:16px;padding:9px 4px;cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:var(--paper);color:var(--ink);font-weight:700}
 
 /* punteggio */
 .scorebar{display:flex;justify-content:space-between;align-items:center;margin:0 12px;padding:6px 2px 8px;border-bottom:1px solid var(--line);font-size:15px}
@@ -190,6 +194,11 @@ td.w{font-weight:700;color:var(--green)}
         <h2>Da solo</h2>
         <p>Tu e il computer contro due computer. A ogni turno puoi chiedere cosa conviene giocare.</p>
         <button class="btn ghost full" id="soloBtn">Gioca contro il computer</button>
+      </div>
+      <div class="sec">
+        <label class="lb">Quanto è bravo il computer</label>
+        <div class="seg" id="levelSeg"><button data-l="facile">Facile</button><button data-l="normale">Normale</button><button data-l="difficile">Difficile</button></div>
+        <p class="note" style="margin-top:8px">Vale per tutti i posti occupati dal computer, anche nei tavoli che crei per giocare in due.</p>
       </div>
       <p class="note">Non serve registrarsi. Chi crea il tavolo tiene l'app aperta finché si gioca.</p>
     </div>
@@ -356,28 +365,85 @@ function finishHand(S){
 
 /* strategy */
 function cv(c){return 1+(c.s==='D'?1.2:0)+(c.s==='D'&&c.v===7?5:0)+({7:1.6,6:0.9,1:0.6}[c.v]||0);}
-function unseenCount(S,p,v,tableAfter){
+function unknownCards(S,p,tableAfter){
   const known=new Set([...S.hands[p],...S.piles[0],...S.piles[1],...tableAfter].map(c=>c.id));
-  let n=0;for(const s of SUITS)if(!known.has(s+v))n++;return n;}
-function evaluate(S,p,m){
+  const out=[];for(const s of SUITS)for(let v=1;v<=10;v++)if(!known.has(s+v))out.push({s,v});return out;}
+/* carte che p non ha visto: né in mano sua, né prese, né sul tavolo adesso */
+function unkInfo(S,p){const u=unknownCards(S,p,S.table);const cnt=Array(11).fill(0);for(const c of u)cnt[c.v]++;return {U:u.length,cnt,T:teamInfo(S,p)};}
+/* probabilità che una mano di h carte, pescata tra U carte sconosciute, contenga almeno una delle n buone */
+function pHas(U,n,h){if(n<=0||h<=0)return 0;if(n>U-h)return 1;let q=1;for(let i=0;i<h;i++)q*=(U-n-i)/(U-i);return 1-q;}
+/* quanto vale una carta per la squadra di p, dato quello che le squadre hanno già preso */
+function teamInfo(S,p){const my=S.piles[team(p)],op=S.piles[1-team(p)];const den=x=>x.filter(k=>k.s==='D').length;
+  const best={};for(const su of SUITS)best[su]=10;for(const k of my)if(PRIM[k.v]>best[k.s])best[k.s]=PRIM[k.v];
+  return {cardsOpen:my.length<=20&&op.length<=20,denOpen:den(my)<=5&&den(op)<=5,best};}
+function cardWorth(S,p,c,T=teamInfo(S,p)){
+  if(!AIW.ctx)return cv(c);
+  let w=T.cardsOpen?1:0.3;
+  if(c.s==='D')w+=T.denOpen?1.3:0.2;
+  if(c.s==='D'&&c.v===7)w+=AIW.sb;
+  w+=Math.max(0,PRIM[c.v]-T.best[c.s])*AIW.prim;
+  return w;}
+const AIW={scopa:11,risk:11,loot:1,mate:0,expose:0.6,drop:0.6,ctx:1,flat:0,prim:0.14,sb:7};
+function evaluate(S,p,m,K=unkInfo(S,p)){
   const last=S.played===39;let s=0;const info={};let tableAfter;
   if(m.take.length){
-    const taken=[m.card,...m.take];s+=taken.reduce((a,c)=>a+cv(c),0);
+    const taken=[m.card,...m.take];s+=taken.reduce((a,c)=>a+cardWorth(S,p,c,K.T),0);
     const ids=new Set(m.take.map(c=>c.id));tableAfter=S.table.filter(c=>!ids.has(c.id));
-    if(!tableAfter.length&&!last){s+=12;info.scopa=true;}
+    if(!tableAfter.length&&!last){s+=AIW.scopa;info.scopa=true;}
     info.sette=taken.some(c=>c.s==='D'&&c.v===7);info.den=taken.filter(c=>c.s==='D').length;
-  }else{tableAfter=[...S.table,m.card];s-=cv(m.card)*0.7;}
+  }else{tableAfter=[...S.table,m.card];s-=cardWorth(S,p,m.card,K.T)*AIW.drop;}
   if(tableAfter.length&&!last){
-    const sum=tableAfter.reduce((a,c)=>a+c.v,0);info.sum=sum;
-    if(sum<=10){const n=unseenCount(S,p,sum,tableAfter);info.risk=n;if(n>0)s-=9*Math.min(1,n/2.5);}else info.risk=0;
-    for(const t of tableAfter)if(cv(t)>2&&unseenCount(S,p,t.v,tableAfter)>0)s-=cv(t)*0.45;
+    const U=K.U;
+    const hOpp=S.hands[(p+1)%4].length,hMate=S.hands[(p+2)%4].length;
+    const cnt=v=>K.cnt[v]||0;
+    const sum=tableAfter.reduce((a,c)=>a+c.v,0);info.sum=sum;info.risk=0;
+    const loot=tableAfter.reduce((a,c)=>a+cardWorth(S,p,c,K.T),0);
+    if(sum<=10){
+      const n=cnt(sum);info.risk=n;
+      /* con una carta uguale sul tavolo l'avversario è obbligato a prendere quella, niente scopa */
+      const blocked=tableAfter.length>1&&tableAfter.some(c=>c.v===sum);
+      const pOpp=blocked?0:pHas(U,n,hOpp);
+      s-=AIW.flat?9*Math.min(1,n/2.5):pOpp*(AIW.risk+AIW.loot*loot);
+      /* se l'avversario non può spazzare, magari ci pensa il compagno */
+      s+=(1-pOpp)*pHas(U-hOpp,n,hMate)*AIW.mate;
+    }
+    for(const t of tableAfter){const w=cardWorth(S,p,t,K.T);if(w>2)s-=pHas(U,cnt(t.v),hOpp)*w*AIW.expose;}
   }
-  if(!m.take.length)info.same=unseenCount(S,p,m.card.v,tableAfter);
+  if(!m.take.length)info.same=K.cnt[m.card.v];
   return {s,info};
 }
-function bestMove(S,p,noise=0){let best=null;
-  for(const m of legalMoves(S,p)){const e=evaluate(S,p,m);const sc=e.s+Math.random()*noise;if(!best||sc>best.sc)best={m,sc,info:e.info};}
+/* versione semplice: guarda solo cosa prende adesso */
+function evaluateEasy(S,p,m){
+  let s=0;const info={};
+  if(m.take.length){s+=[m.card,...m.take].reduce((a,c)=>a+cv(c),0);if(m.take.length===S.table.length&&S.played<39){s+=8;info.scopa=true;}}
+  else s-=cv(m.card)*0.5;
+  return {s,info};}
+function bestMove(S,p,noise=0,easy=false){let best=null;const K=easy?null:unkInfo(S,p);
+  for(const m of legalMoves(S,p)){const e=easy?evaluateEasy(S,p,m):evaluate(S,p,m,K);const sc=e.s+Math.random()*noise;if(!best||sc>best.sc)best={m,sc,info:e.info};}
   return best;}
+/* livello difficile: per ogni giocata immagina K distribuzioni plausibili delle carte che non vede
+   (senza sbirciare quelle vere), gioca la mano fino in fondo e tiene la giocata che rende di più in media */
+function lightClone(S){return {hands:S.hands.map(h=>h.slice()),table:S.table.slice(),piles:[S.piles[0].slice(),S.piles[1].slice()],
+  scope:S.scope.slice(),score:S.score.slice(),lastTaker:S.lastTaker,played:S.played,turn:S.turn,phase:'play',rev:0,dealer:S.dealer};}
+function determinize(S,p){const T=lightClone(S);const u=unknownCards(S,p,S.table).map(c=>({s:c.s,v:c.v,id:c.s+c.v}));
+  for(let i=u.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[u[i],u[j]]=[u[j],u[i]];}
+  let k=0;for(let q=0;q<4;q++)if(q!==p){const n=S.hands[q].length;T.hands[q]=u.slice(k,k+n);k+=n;}return T;}
+function handValue(T,p){const me=team(p),r=T.result,P=T.piles;
+  const den=x=>x.filter(c=>c.s==='D').length;
+  return r.pts[me]-r.pts[1-me]+0.04*(P[me].length-P[1-me].length)+0.1*(den(P[me])-den(P[1-me]))+0.01*(primiera(P[me])-primiera(P[1-me]));}
+function mcMove(S,p,K){
+  const moves=legalMoves(S,p);if(moves.length===1)return {m:moves[0],info:evaluate(S,p,moves[0]).info};
+  const worlds=[];for(let k=0;k<K;k++)worlds.push(determinize(S,p));
+  let best=null;
+  for(const m of moves){let tot=0;
+    for(const W of worlds){const T=lightClone(W);applyMove(T,p,m);
+      while(T.phase==='play'){const q=T.turn;applyMove(T,q,bestMove(T,q,0.3).m);}
+      tot+=handValue(T,p);}
+    if(!best||tot>best.tot)best={m,tot};}
+  return {m:best.m,info:evaluate(S,p,best.m).info};}
+const LEVELS={facile:{noise:4,easy:true},normale:{noise:2.5},difficile:{mc:24}};
+let level=lsGet('scopone_level');if(!LEVELS[level])level='normale';
+function botMove(S,p){const L=LEVELS[level];return L.mc?mcMove(S,p,L.mc):bestMove(S,p,L.noise,!!L.easy);}
 function explain(S,b){
   const m=b.m,i=b.info;
   if(m.take.length){const what=m.take.map(short).join(' + ');
@@ -444,7 +510,7 @@ function maybeBot(){
   if(!isDriver()||!A||A.phase!=='play')return;
   const p=A.turn;if(!A.seats[p]||!A.seats[p].bot)return;const rev=A.rev;
   setTimeout(()=>{if(!A||A.rev!==rev||A.phase!=='play'||anim)return;
-    const ns=clone(A);const b=bestMove(ns,p,0.5);if(applyMove(ns,p,b.m))hostCommit(ns);},800);
+    const ns=clone(A);const b=botMove(ns,p);if(applyMove(ns,p,b.m))hostCommit(ns);},800);
 }
 function userPlay(m){
   if(!myTurnNow())return;sel=null;
@@ -492,7 +558,7 @@ function render(){
   if(mySeated()){
     $('#hand').innerHTML=S.hands[view].map(c=>cardHTML(c,(sel===c.id?'sel':'')+(!myTurn?' dim':''))).join('');
     $('#hand').querySelectorAll('.card').forEach(el=>el.onclick=()=>{if(!myTurnNow())return;sel=sel===el.dataset.id?null:el.dataset.id;render();renderActions();});
-    if(hintOn&&myTurn){const b=bestMove(S,view);const e=$('#hand').querySelector(`[data-id="${b.m.card.id}"]`);if(e)e.classList.add('hint');}
+    if(hintOn&&myTurn){const b=getHint();const e=$('#hand').querySelector(`[data-id="${b.m.card.id}"]`);if(e)e.classList.add('hint');}
   }else $('#hand').innerHTML=`<div class="note">Stai guardando: non sei seduto a questo tavolo.</div>`;
 }
 function myTurnNow(){return !!(S&&S.phase==='play'&&S.turn===view&&mySeated()&&!anim);}
@@ -507,7 +573,9 @@ function renderActions(){
   else opts.forEach(o=>{const b=document.createElement('button');b.className='btn go';b.textContent='Prendi '+o.map(short).join(' + ');b.onclick=()=>userPlay({card:c,take:o});a.appendChild(b);});
   a.appendChild(hb);
 }
-function showHint(){if(!myTurnNow())return;const b=bestMove(S,view);$('#hintbox').innerHTML=explain(S,b);$('#hintbox').classList.add('on');}
+let hintCache=null;
+function getHint(){if(!hintCache||hintCache.S!==S)hintCache={S,b:mcMove(S,view,16)};return hintCache.b;}
+function showHint(){if(!myTurnNow())return;const b=getHint();$('#hintbox').innerHTML=explain(S,b);$('#hintbox').classList.add('on');}
 function showResult(){
   const r=S.result,mt=team(view),ot=1-mt;const Av=x=>mt===0?x.a:x.b,Bv=x=>mt===0?x.b:x.a;
   const over=S.phase==='over';
@@ -676,6 +744,8 @@ $('#nick').onchange=()=>{const v=$('#nick').value.trim();if(v){nick=v;lsSet('sco
 $('#nick2').onchange=()=>{const v=$('#nick2').value.trim();if(v){nick=v;lsSet('scopone_nick',v);$('#nick').value=v;}};
 $('#soloBtn').onclick=()=>{const v=$('#nick').value.trim();if(v){nick=v;lsSet('scopone_nick',v);}startLocal();};
 $('#createBtn').onclick=()=>{if(saveNick())startHost(null);};
+function paintLevel(){document.querySelectorAll('#levelSeg button').forEach(b=>b.classList.toggle('on',b.dataset.l===level));}
+document.querySelectorAll('#levelSeg button').forEach(b=>b.onclick=()=>{level=b.dataset.l;lsSet('scopone_level',level);paintLevel();});paintLevel();
 $('#duoTeamBtn').onclick=()=>{if(saveNick())startHost(null,'coppia');};
 $('#duoVsBtn').onclick=()=>{if(saveNick())startHost(null,'contro');};
 $('#joinBtn').onclick=()=>{const c=$('#codeIn').value.trim().toUpperCase();if(c.length!==5){toast('Il codice ha 5 caratteri.');return;}if(!saveNick())return;joinTable(c);};
