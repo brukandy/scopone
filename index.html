@@ -181,6 +181,12 @@ td.w{font-weight:700;color:var(--green)}
         </div>
       </div>
       <div class="sec">
+        <h2>In due</h2>
+        <p>Il computer prende gli altri due posti. Potete stare in coppia, oppure uno contro l'altro con un computer per compagno. Crei il tavolo e mandi il link.</p>
+        <button class="btn ghost full" id="duoTeamBtn">In coppia contro il computer</button>
+        <button class="btn ghost full" id="duoVsBtn" style="margin-top:8px">Uno contro l'altro</button>
+      </div>
+      <div class="sec">
         <h2>Da solo</h2>
         <p>Tu e il computer contro due computer. A ogni turno puoi chiedere cosa conviene giocare.</p>
         <button class="btn ghost full" id="soloBtn">Gioca contro il computer</button>
@@ -557,7 +563,7 @@ function lobbyWait(msg){showScreen('lobby');$('#lobbyCode').textContent=code||'-
 function sendTo(pid,obj){netSend(TOPIC+code+'/p/'+pid,obj);}
 function broadcast(){if(!A)return;const ids=new Set(lastSeen.keys());for(const s of A.seats)if(s&&s.pid&&!s.bot)ids.add(s.pid);ids.delete(myId);
   for(const pid of ids)sendTo(pid,{t:'state',S:sanitize(A,pid)});}
-function startHost(resume){
+function startHost(resume,preset){
   if(!window.mqtt){toast('Connessione non disponibile: ricarica la pagina.');return;}
   resetSession();mode='host';
   code=resume?resume.code:genCode();
@@ -567,7 +573,9 @@ function startHost(resume){
   if(resume){A=resume.A;for(const s of A.seats)if(s&&s.pid&&!s.bot&&s.pid!==myId)lastSeen.set(s.pid,now);}
   netOpen([TOPIC+code+'/h'],onHostMsg,()=>broadcast());
   if(resume){queuedRev=-1;hostCommit(A);toast('Tavolo riaperto.');}
-  else hostCommit(newMatch([{pid:myId,nick:nick||'Tu',bot:false,on:true},null,null,null],myId));
+  else{const me={pid:myId,nick:nick||'Tu',bot:false,on:true},B={bot:true};
+    const seats=preset==='coppia'?[me,B,null,B]:preset==='contro'?[me,null,B,B]:[me,null,null,null];
+    hostCommit(newMatch(seats,myId));}
   hbTimer=setInterval(()=>{
     if(!A)return;const t=Date.now();
     A.seats.forEach(s=>{if(s&&s.pid&&!s.bot&&s.pid!==myId&&s.on!==false&&t-(lastSeen.get(s.pid)||0)>15000)setOnFlag(s.pid,false);});
@@ -668,6 +676,8 @@ $('#nick').onchange=()=>{const v=$('#nick').value.trim();if(v){nick=v;lsSet('sco
 $('#nick2').onchange=()=>{const v=$('#nick2').value.trim();if(v){nick=v;lsSet('scopone_nick',v);$('#nick').value=v;}};
 $('#soloBtn').onclick=()=>{const v=$('#nick').value.trim();if(v){nick=v;lsSet('scopone_nick',v);}startLocal();};
 $('#createBtn').onclick=()=>{if(saveNick())startHost(null);};
+$('#duoTeamBtn').onclick=()=>{if(saveNick())startHost(null,'coppia');};
+$('#duoVsBtn').onclick=()=>{if(saveNick())startHost(null,'contro');};
 $('#joinBtn').onclick=()=>{const c=$('#codeIn').value.trim().toUpperCase();if(c.length!==5){toast('Il codice ha 5 caratteri.');return;}if(!saveNick())return;joinTable(c);};
 $('#leaveLobby').onclick=()=>{if(mode==='host'&&!confirmLeave())return;goHome();};
 $('#leaveGame').onclick=()=>{if(mode==='host'&&!confirmLeave())return;goHome();};
